@@ -107,6 +107,10 @@ uniform float uHoloMix;
 uniform float uPhosphorIntensity;
 uniform float uBrightBoost;
 uniform vec2 uLogoOffset;
+uniform float uSandstorm;
+uniform float uBeatPulse;
+uniform float uVolume;
+uniform sampler2D uFreq;
 
 vec3 hsv2rgb(vec3 c) {
     vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -143,11 +147,15 @@ void main() {
     vec2 pixelUv = (floor(uv * crtRes) + 0.5) / crtRes;
     vec2 pf = fract(uv * crtRes); // position within each CRT pixel
 
-    // --- Map pixelated UV to logo UV (DVD bounce offset) ---
+    // --- Map pixelated UV to logo UV (DVD bounce offset + beat pulse) ---
     vec2 logoUv = pixelUv - 0.5;
     logoUv.x *= aspect;
     float scale = aspect > 1.0 ? 2.8 : 2.0;
-    logoUv = logoUv * scale + 0.5 - uLogoOffset * scale;
+    // Volume grows the baseline size, beat pulse adds subtle rhythmic kick
+    float volumeGrow = uVolume * 0.3;
+    float beatBounce = uBeatPulse * 0.08;
+    float beatScale = 1.0 - volumeGrow + beatBounce;
+    logoUv = logoUv * scale * beatScale + 0.5 - uLogoOffset * scale;
     vec2 texUv = vec2(logoUv.x, 1.0 - logoUv.y);
 
     vec2 sampleUv = texUv;
@@ -171,6 +179,16 @@ void main() {
     vec3 holoColor = hsv2rgb(vec3(fract(hue), saturation, 1.0));
     vec3 baseTint = vec3(0.9, 0.95, 1.1);
     vec3 color = vec3(r, g, b) * mix(baseTint, holoColor, uHoloMix);
+
+    // --- Music visualizer (sandstorm mode) ---
+    if (uSandstorm > 0.5) {
+        vec3 viz = texture2D(uFreq, vec2(vUv.x, 1.0 - vUv.y)).rgb;
+        if (mask < 0.05) {
+            color = max(color, viz);
+        } else {
+            color += viz * 0.2;
+        }
+    }
 
     // --- CRT "black" — that warm grey-green behind the glass ---
     vec3 crtBlack = vec3(0.025, 0.03, 0.022);
@@ -277,6 +295,10 @@ const loc = {
     phosphorIntensity:gl.getUniformLocation(program, 'uPhosphorIntensity'),
     brightBoost:      gl.getUniformLocation(program, 'uBrightBoost'),
     logoOffset:       gl.getUniformLocation(program, 'uLogoOffset'),
+    sandstorm:        gl.getUniformLocation(program, 'uSandstorm'),
+    beatPulse:        gl.getUniformLocation(program, 'uBeatPulse'),
+    volume:           gl.getUniformLocation(program, 'uVolume'),
+    freq:             gl.getUniformLocation(program, 'uFreq'),
 };
 
 // --- Load SVG as WebGL texture ---
@@ -336,6 +358,348 @@ canvas.addEventListener('touchmove', e => {
     pushMouse(t.clientX / viewW, t.clientY / viewH);
 }, { passive: false });
 
+// --- Sandstorm mode ---
+let sandstormActive = false;
+let sandstormAudio = null;
+let sandstormAnalyser = null;
+let sandstormFreqData = null;
+let sandstormCtx = null;
+
+// --- Visualizer canvas (particle system renders here) ---
+const VIZ_W = 640, VIZ_H = 360;
+const vizCanvas = document.createElement('canvas');
+vizCanvas.width = VIZ_W;
+vizCanvas.height = VIZ_H;
+const vizCtx = vizCanvas.getContext('2d');
+vizCtx.fillStyle = '#000';
+vizCtx.fillRect(0, 0, VIZ_W, VIZ_H);
+
+const freqTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE2);
+gl.bindTexture(gl.TEXTURE_2D, freqTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+// --- Smooth noise for gentle wave motion ---
+function sNoise(x, y) {
+    const a = Math.sin(x * 1.17 + y * 2.36) * 0.5;
+    const b = Math.sin(x * 0.73 - y * 1.89) * 0.5;
+    const c = Math.sin(x * 2.05 + y * 0.94) * 0.3;
+    return a + b + c;
+}
+
+// --- Laser beam system ---
+const MAX_BEAMS = 500;
+const beams = [];
+
+function resetBeam(b) {
+    const cx = VIZ_W / 2, cy = VIZ_H / 2;
+    b.x = cx;
+    b.y = cy;
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 0.3 + Math.random() * 0.7;
+    b.vx = Math.cos(angle) * speed;
+    b.vy = Math.sin(angle) * speed * 0.5;
+    b.life = 0;
+    b.maxLife = 6 + Math.random() * 8;
+    b.hue = Math.random();
+    b.width = 1.0 + Math.random() * 2.0;
+    b.waveOffset = Math.random() * Math.PI * 2;
+    b.active = true;
+
+    // Personality: 0 = smooth & flowy, 1 = playful & wavey
+    b.personality = Math.random();
+    if (b.personality < 0.4) {
+        // Smooth — slow gentle curves
+        b.waveFreq = 0.08 + Math.random() * 0.15;
+        b.waveAmp = 5 + Math.random() * 10;
+        b.waveFreq2 = 0;
+        b.waveAmp2 = 0;
+    } else if (b.personality < 0.75) {
+        // Medium — flowing with some bounce
+        b.waveFreq = 0.2 + Math.random() * 0.4;
+        b.waveAmp = 12 + Math.random() * 20;
+        b.waveFreq2 = 0.5 + Math.random() * 0.8;
+        b.waveAmp2 = 4 + Math.random() * 8;
+    } else {
+        // Playful — fast wiggly motion, multiple harmonics
+        b.waveFreq = 0.5 + Math.random() * 1.2;
+        b.waveAmp = 15 + Math.random() * 30;
+        b.waveFreq2 = 1.5 + Math.random() * 2.5;
+        b.waveAmp2 = 8 + Math.random() * 15;
+    }
+    b.trail = [];
+}
+
+for (let i = 0; i < MAX_BEAMS; i++) {
+    const b = { x:0, y:0, vx:0, vy:0, life:0, maxLife:1, hue:0, width:1,
+                waveOffset:0, waveFreq:1, waveAmp:10, waveFreq2:0, waveAmp2:0,
+                personality:0, active:false, trail:[] };
+    resetBeam(b);
+    b.active = false; // start inactive, music activates them
+    beams.push(b);
+}
+let beamsInitialized = false;
+
+let smoothBass = 0, smoothMid = 0, smoothTreble = 0, smoothEnergy = 0;
+let smoothVolume = 0;
+// 136 BPM locked pulse
+const BPM = 136;
+const BEAT_INTERVAL = 60 / BPM; // ~0.441s
+let sandstormStartTime = 0;
+
+function updateVisualizer(dt, t) {
+    if (!sandstormAnalyser || !sandstormFreqData || !beamsInitialized) return;
+    sandstormAnalyser.getByteFrequencyData(sandstormFreqData);
+
+    // Compute bass, mid, treble energy
+    const len = sandstormFreqData.length;
+    let bass = 0, mid = 0, treble = 0;
+    for (let i = 0; i < len; i++) {
+        const v = sandstormFreqData[i] / 255;
+        if (i < len * 0.15) bass += v;
+        else if (i < len * 0.5) mid += v;
+        else treble += v;
+    }
+    bass /= (len * 0.15);
+    mid /= (len * 0.35);
+    treble /= (len * 0.5);
+
+    // Smooth the values — fast attack, slower release for punchy feel
+    const smooth = 0.35;
+    smoothBass += (bass - smoothBass) * smooth;
+    smoothMid += (mid - smoothMid) * smooth;
+    smoothTreble += (treble - smoothTreble) * smooth;
+    smoothEnergy = smoothBass * 0.5 + smoothMid * 0.3 + smoothTreble * 0.2;
+
+    const cx = VIZ_W / 2, cy = VIZ_H / 2;
+
+    // Fade — faster when music is pumping for more dynamic feel
+    vizCtx.globalCompositeOperation = 'source-over';
+    vizCtx.fillStyle = `rgba(0, 0, 0, ${(0.05 + smoothEnergy * 0.04).toFixed(3)})`;
+    vizCtx.fillRect(0, 0, VIZ_W, VIZ_H);
+
+    vizCtx.globalCompositeOperation = 'lighter';
+    const baseHue = (t * 0.03) % 1;
+
+    // Don't spawn beams until there's actual audio signal
+    if (smoothEnergy < 0.01) {
+        sandstormStartTime = t; // keep resetting so BPM syncs with first sound
+        return { beat: 0, volume: 0 };
+    }
+
+    // How many beams should be active — scales with loudness
+    const targetActive = Math.floor(20 + smoothEnergy * 280 + smoothBass * 100);
+
+    let activeCount = 0;
+    for (const b of beams) {
+        if (b.active) activeCount++;
+    }
+
+    // Activate more beams when music gets louder
+    if (activeCount < targetActive) {
+        let toActivate = Math.min(targetActive - activeCount, 10); // spawn more per frame
+        for (const b of beams) {
+            if (!b.active && toActivate > 0) {
+                resetBeam(b);
+                b.active = true;
+                toActivate--;
+            }
+        }
+    }
+
+    for (const b of beams) {
+        if (!b.active) continue;
+
+        b.life += dt;
+        if (b.life > b.maxLife) {
+            // Only respawn if we still need this many beams
+            if (activeCount > targetActive) {
+                b.active = false;
+                activeCount--;
+                continue;
+            }
+            resetBeam(b);
+        }
+
+        const prevX = b.x, prevY = b.y;
+
+        // Distance from center — beams accelerate as they move outward
+        const dx = b.x - cx, dy = b.y - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const distNorm = dist / (VIZ_W / 2);
+        const accel = 1.0 + distNorm * 3.0;
+
+        const wave = 0;
+        const noiseY = 0;
+
+        // Speed surges with the beat, accelerates with distance
+        const speed = (1.2 + smoothEnergy * 3.0) * 60 * accel;
+        b.x += b.vx * speed * dt;
+        b.y += (b.vy + (wave + noiseY) * 0.006) * speed * dt;
+
+        // Radial distance from center (normalized 0-1)
+        const fdx = (b.x - cx) / (VIZ_W / 2);
+        const fdy = (b.y - cy) / (VIZ_H / 2);
+        const distFromCenter = Math.sqrt(fdx * fdx + fdy * fdy);
+
+        // Alpha & size: visible early near center, brighter toward edges
+        const lifeAlpha = Math.sin(Math.min(b.life / b.maxLife, 1) * Math.PI);
+        const edgeBright = 0.3 + Math.pow(Math.min(distNorm, 1), 0.4) * 0.7;
+        const fadeOut = distNorm > 0.85 ? 1.0 - (distNorm - 0.85) / 0.15 : 1.0;
+        const alpha = lifeAlpha * edgeBright * fadeOut * (0.6 + smoothEnergy * 0.8);
+
+        if (alpha < 0.005) continue;
+
+        // Consistent width — very slight growth, no fat heads
+        const sizeGrow = 0.8 + distNorm * 0.4;
+
+        // Color — slow hue cycling, each beam slightly different
+        const hue = ((baseHue + b.hue * 0.4) % 1) * 360;
+        const sat = 85 + smoothTreble * 15;
+        const lum = 60 + distNorm * 15 + smoothMid * 20;
+
+        // Draw core line
+        vizCtx.strokeStyle = `hsla(${hue}, ${sat}%, ${lum}%, ${alpha.toFixed(3)})`;
+        vizCtx.lineWidth = b.width * sizeGrow * (1 + smoothBass * 0.5);
+        vizCtx.lineCap = 'butt';
+        vizCtx.beginPath();
+        vizCtx.moveTo(prevX, prevY + wave * 0.25);
+        vizCtx.lineTo(b.x, b.y + wave * 0.25);
+        vizCtx.stroke();
+
+        // Soft glow layer — only slightly wider than core
+        vizCtx.strokeStyle = `hsla(${hue}, ${sat}%, ${lum + 20}%, ${(alpha * 0.15).toFixed(3)})`;
+        vizCtx.lineWidth = b.width * sizeGrow * (2 + smoothBass * 1.5);
+        vizCtx.beginPath();
+        vizCtx.moveTo(prevX, prevY + wave * 0.25);
+        vizCtx.lineTo(b.x, b.y + wave * 0.25);
+        vizCtx.stroke();
+    }
+
+    // 136 BPM locked pulse — only kicks in after the drop (~29s)
+    const elapsed = t - sandstormStartTime;
+    let beatPulseVal = 0;
+    if (elapsed > 29) {
+        const beatPhase = (elapsed % BEAT_INTERVAL) / BEAT_INTERVAL;
+        beatPulseVal = Math.cos(beatPhase * Math.PI * 2) * 0.5 + 0.5;
+    }
+
+    // Slow-moving volume — gradual baseline growth
+    smoothVolume += (smoothEnergy - smoothVolume) * 0.03;
+
+    return { beat: beatPulseVal, volume: smoothVolume };
+}
+
+let logoTransition = null; // { fromX, fromY, startTime, duration }
+
+function activateSandstorm() {
+    if (sandstormActive) return;
+    sandstormActive = true;
+
+    // Animate logo from current DVD position to center
+    dvdVx = 0; dvdVy = 0; // stop bouncing
+    logoTransition = { fromX: dvdX, fromY: dvdY, startTime: performance.now(), duration: 600 };
+
+    // Setup audio
+    sandstormAudio = new Audio('Darude - Sandstorm.mp3');
+    sandstormAudio.crossOrigin = 'anonymous';
+    sandstormAudio.loop = true;
+
+    sandstormCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = sandstormCtx.createMediaElementSource(sandstormAudio);
+    sandstormAnalyser = sandstormCtx.createAnalyser();
+    sandstormAnalyser.fftSize = 1024;
+    sandstormAnalyser.smoothingTimeConstant = 0.6;
+    sandstormFreqData = new Uint8Array(sandstormAnalyser.frequencyBinCount);
+
+    // Gain node for mute control (keeps analyser receiving data)
+    const gainNode = sandstormCtx.createGain();
+    source.connect(sandstormAnalyser);
+    sandstormAnalyser.connect(gainNode);
+    gainNode.connect(sandstormCtx.destination);
+    window._sandstormGain = gainNode;
+
+    sandstormAudio.play().catch(e => console.warn('Audio play failed:', e));
+    window._sandstormAudio = sandstormAudio;
+
+    // Reset all beams — start inactive, music will activate them
+    for (const b of beams) { resetBeam(b); b.active = false; }
+    beamsInitialized = true;
+    sandstormStartTime = time;
+
+    // Show controls
+    const controls = document.getElementById('sandstorm-ctrl');
+    if (controls) controls.classList.add('active');
+}
+
+function deactivateSandstorm() {
+    if (!sandstormActive) return;
+    sandstormActive = false;
+
+    if (sandstormAudio) {
+        sandstormAudio.pause();
+        sandstormAudio.currentTime = 0;
+        sandstormAudio = null;
+        window._sandstormAudio = null;
+        window._sandstormGain = null;
+    }
+    if (sandstormCtx) {
+        sandstormCtx.close();
+        sandstormCtx = null;
+    }
+    sandstormAnalyser = null;
+    sandstormFreqData = null;
+
+    // Restart DVD bounce
+    dvdVx = 0.12; dvdVy = 0.08;
+
+    // Hide controls
+    const controls = document.getElementById('sandstorm-ctrl');
+    if (controls) controls.classList.remove('active');
+
+    // Clear visualizer canvas
+    vizCtx.fillStyle = '#000';
+    vizCtx.fillRect(0, 0, VIZ_W, VIZ_H);
+    beamsInitialized = false;
+}
+
+// Key sequence: up, down, left, right, a, b, c, Enter
+const SECRET_CODE = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','a','b','c','Enter'];
+let codeIndex = 0;
+
+document.addEventListener('keydown', e => {
+    if (e.key === SECRET_CODE[codeIndex]) {
+        codeIndex++;
+        if (codeIndex === SECRET_CODE.length) {
+            codeIndex = 0;
+            if (sandstormActive) {
+                deactivateSandstorm();
+            } else {
+                activateSandstorm();
+            }
+        }
+    } else {
+        codeIndex = e.key === SECRET_CODE[0] ? 1 : 0;
+    }
+});
+
+// Escape exits sandstorm, space toggles pause in sandstorm mode
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && sandstormActive) {
+        deactivateSandstorm();
+    }
+    if (e.key === ' ' && sandstormActive) {
+        e.preventDefault();
+        document.getElementById('ss-pause').click();
+    }
+});
+
+// Expose for controls
+window._sandstorm = { activateSandstorm, deactivateSandstorm };
+
 // --- DVD bounce state ---
 // Logo occupies roughly 1/scale of the screen in each axis
 // We track position as the center offset from screen center (in 0-1 UV space)
@@ -366,6 +730,17 @@ function frame(now) {
     if (dvdX < -maxX) { dvdX = -maxX; dvdVx =  Math.abs(dvdVx); }
     if (dvdY > maxY)  { dvdY = maxY;  dvdVy = -Math.abs(dvdVy); }
     if (dvdY < -maxY) { dvdY = -maxY; dvdVy =  Math.abs(dvdVy); }
+
+    // Smooth transition to center for sandstorm activation
+    if (logoTransition) {
+        const elapsed = performance.now() - logoTransition.startTime;
+        const t = Math.min(elapsed / logoTransition.duration, 1);
+        // Ease out cubic
+        const ease = 1 - Math.pow(1 - t, 3);
+        dvdX = logoTransition.fromX * (1 - ease);
+        dvdY = logoTransition.fromY * (1 - ease);
+        if (t >= 1) { dvdX = 0; dvdY = 0; logoTransition = null; }
+    }
 
     // Update heat map: fade then draw cursor trail
     const fadeAlpha = 1 - Math.pow(0.01, dt / cfg.fadeSec);
@@ -418,6 +793,20 @@ function frame(now) {
     gl.uniform1f(loc.phosphorIntensity, cfg.phosphorIntensity);
     gl.uniform1f(loc.brightBoost, cfg.brightBoost);
     gl.uniform2f(loc.logoOffset, dvdX, dvdY);
+    gl.uniform1f(loc.sandstorm, sandstormActive ? 1.0 : 0.0);
+
+    // Update visualizer particle system
+    let beatPulse = 0, volumeLevel = 0;
+    if (sandstormActive) {
+        const result = updateVisualizer(dt, time);
+        if (result) { beatPulse = result.beat; volumeLevel = result.volume; }
+    }
+    gl.uniform1f(loc.beatPulse, beatPulse);
+    gl.uniform1f(loc.volume, volumeLevel);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, freqTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vizCanvas);
+    gl.uniform1i(loc.freq, 2);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -488,6 +877,32 @@ function frame(now) {
 
     <div class="sec">CURSOR</div>
     <div id="cursor-row"></div>
+</div>
+
+<style>
+#sandstorm-ctrl {
+    position:fixed;bottom:16px;right:16px;z-index:999;
+    display:none;gap:8px;align-items:center;
+    user-select:none;
+}
+#sandstorm-ctrl.active{display:flex}
+#sandstorm-ctrl button {
+    width:32px;height:32px;
+    background:transparent;
+    border:1px solid rgba(255,255,255,0.2);
+    border-radius:50%;
+    color:rgba(255,255,255,0.5);
+    cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    padding:0;transition:border-color 0.2s, color 0.2s;
+}
+#sandstorm-ctrl button:hover{border-color:rgba(255,255,255,0.5);color:rgba(255,255,255,0.8)}
+#sandstorm-ctrl button svg{width:14px;height:14px;fill:currentColor}
+</style>
+
+<div id="sandstorm-ctrl">
+    <button id="ss-pause" title="Pause"><svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></button>
+    <button id="ss-mute" title="Mute"><svg viewBox="0 0 24 24"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><path d="M15.54 8.46a5 5 0 010 7.07" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M19.07 4.93a10 10 0 010 14.14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
 </div>
 
 <script>
@@ -621,6 +1036,41 @@ function frame(now) {
         if (e.key === 'h' || e.key === 'H') {
             panel.style.display = panel.style.display === 'none' ? '' : 'none';
         }
+    });
+
+    // --- Sandstorm controls ---
+    const ssPause = document.getElementById('ss-pause');
+    const ssMute = document.getElementById('ss-mute');
+
+    const pauseIcon = '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
+    const playIcon = '<svg viewBox="0 0 24 24"><polygon points="6,4 20,12 6,20"/></svg>';
+    const muteIcon = '<svg viewBox="0 0 24 24"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><line x1="16" y1="9" x2="22" y2="15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="22" y1="9" x2="16" y2="15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+    const unmuteIcon = '<svg viewBox="0 0 24 24"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><path d="M15.54 8.46a5 5 0 010 7.07" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M19.07 4.93a10 10 0 010 14.14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+
+    let isMuted = false;
+
+    ssPause.addEventListener('click', () => {
+        const audio = window._sandstormAudio;
+        if (!audio) return;
+
+        if (audio.paused) {
+            audio.play();
+            ssPause.innerHTML = pauseIcon;
+            ssPause.title = 'Pause';
+        } else {
+            audio.pause();
+            ssPause.innerHTML = playIcon;
+            ssPause.title = 'Play';
+        }
+    });
+
+    ssMute.addEventListener('click', () => {
+        const gainNode = window._sandstormGain;
+        if (!gainNode) return;
+        isMuted = !isMuted;
+        gainNode.gain.value = isMuted ? 0 : 1;
+        ssMute.innerHTML = isMuted ? muteIcon : unmuteIcon;
+        ssMute.title = isMuted ? 'Unmute' : 'Mute';
     });
 })();
 </script>
