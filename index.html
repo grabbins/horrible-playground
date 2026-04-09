@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>HORRIBLE</title>
+<style>
+*{margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:#000}
+canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false });
+if (!gl) { document.body.innerText = 'WebGL not supported'; return; }
+
+let time = 0;
+let mouseX = 0.5, mouseY = 0.5;
+let prevMouseX = 0.5, prevMouseY = 0.5;
+let viewW = 0, viewH = 0;
+
+// --- Config (exposed for control panel) ---
+const cfg = window._cfg = {
+    // Trail (existing)
+    brightness: 0.50, width: 0.5, fadeSec: 0.30, smoothing: 20,
+    // CRT Effects
+    crtCurvature: 0.25, crtResolution: 180.0, scanlineIntensity: 0.55,
+    chromAb: 0.004, crtFlicker: 1.0, vignette: 1.8,
+    // Glow & Color
+    glowSize: 0.014, glowIntensity: 0.25, holoSat: 0.3,
+    holoSpeed: 0.1, holoMix: 0.3, phosphorIntensity: 0.35, brightBoost: 1.4,
+    // Cursor
+    cursor: 'dot',
+};
+
+// --- Mouse position history for Catmull-Rom interpolation ---
+const mouseHistory = [
+    { x: 0.5, y: 0.5 },
+    { x: 0.5, y: 0.5 },
+    { x: 0.5, y: 0.5 },
+    { x: 0.5, y: 0.5 },
+];
+
+function catmullRom(p0, p1, p2, p3, t) {
+    const t2 = t * t, t3 = t2 * t;
+    return 0.5 * (
+        (2 * p1) +
+        (-p0 + p2) * t +
+        (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+        (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+    );
+}
+
+function resize() {
+    const dpr = devicePixelRatio || 1;
+    viewW = innerWidth;
+    viewH = innerHeight;
+    canvas.width = viewW * dpr;
+    canvas.height = viewH * dpr;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener('resize', resize);
+resize();
+
+function compileShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error('Shader error:', gl.getShaderInfoLog(s));
+    }
+    return s;
+}
+
+const vertexSrc = `
+attribute vec2 aPos;
+varying vec2 vUv;
+void main() {
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const fragmentSrc = `
+precision highp float;
+
+varying vec2 vUv;
+uniform sampler2D uTex;
+uniform sampler2D uHeat;
+uniform float uTime;
+uniform vec2 uRes;
+uniform float uTrailBright;
+uniform float uCrtCurvature;
+uniform float uCrtResolution;
+uniform float uScanlineIntensity;
+uniform float uChromAb;
+uniform float uCrtFlicker;
+uniform float uVignette;
+uniform float uGlowSize;
+uniform float uGlowIntensity;
+uniform float uHoloSat;
+uniform float uHoloSpeed;
+uniform float uHoloMix;
+uniform float uPhosphorIntensity;
+uniform float uBrightBoost;
+uniform vec2 uLogoOffset;
+
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+// --- CRT barrel distortion ---
+vec2 crtCurve(vec2 uv) {
+    vec2 c = uv - 0.5;
+    float r2 = dot(c, c);
+    return c * (1.0 + r2 * uCrtCurvature) + 0.5;
+}
+
+// --- Rounded rectangle SDF ---
+float roundBox(vec2 p, vec2 b, float r) {
+    vec2 d = abs(p) - b + vec2(r);
+    return length(max(d, vec2(0.0))) - r;
+}
+
+void main() {
+    vec2 uv = vUv;
+
+    float aspect = uRes.x / uRes.y;
+
+    // --- Low-res CRT pixelation ---
+    float crtRows = uCrtResolution;
+    float crtCols = crtRows * aspect;
+    vec2 crtRes = vec2(crtCols, crtRows);
+    vec2 pixelUv = (floor(uv * crtRes) + 0.5) / crtRes;
+    vec2 pf = fract(uv * crtRes); // position within each CRT pixel
+
+    // --- Map pixelated UV to logo UV (DVD bounce offset) ---
+    vec2 logoUv = pixelUv - 0.5;
+    logoUv.x *= aspect;
+    float scale = aspect > 1.0 ? 2.8 : 2.0;
+    logoUv = logoUv * scale + 0.5 - uLogoOffset * scale;
+    vec2 texUv = vec2(logoUv.x, 1.0 - logoUv.y);
+
+    vec2 sampleUv = texUv;
+
+    // --- Chromatic aberration ---
+    float caAmount = uChromAb;
+
+    // --- Sample logo texture with RGB split ---
+    float r = 0.0, g = 0.0, b = 0.0;
+    bool inBounds = sampleUv.x > 0.0 && sampleUv.x < 1.0 && sampleUv.y > 0.0 && sampleUv.y < 1.0;
+    if (inBounds) {
+        r = texture2D(uTex, clamp(sampleUv + vec2(caAmount, 0.0), 0.0, 1.0)).r;
+        g = texture2D(uTex, sampleUv).g;
+        b = texture2D(uTex, clamp(sampleUv - vec2(caAmount, 0.0), 0.0, 1.0)).b;
+    }
+    float mask = max(max(r, g), b);
+
+    // --- Holographic color shift ---
+    float hue = logoUv.x * 0.6 + logoUv.y * 0.4 + uTime * uHoloSpeed;
+    float saturation = uHoloSat;
+    vec3 holoColor = hsv2rgb(vec3(fract(hue), saturation, 1.0));
+    vec3 baseTint = vec3(0.9, 0.95, 1.1);
+    vec3 color = vec3(r, g, b) * mix(baseTint, holoColor, uHoloMix);
+
+    // --- CRT "black" — that warm grey-green behind the glass ---
+    vec3 crtBlack = vec3(0.025, 0.03, 0.022);
+    color = max(color, crtBlack);
+
+    // --- Phosphor persistence trail ---
+    float heat = texture2D(uHeat, vec2(vUv.x, 1.0 - vUv.y)).r;
+    if (mask < 0.05) {
+        color += vec3(heat * uTrailBright);
+    }
+
+    // --- Boost brightness to compensate for CRT darkening ---
+    color *= uBrightBoost;
+
+    // --- Scanline gaps between CRT pixel rows ---
+    float scanGap = smoothstep(0.0, 0.25, pf.y) * smoothstep(1.0, 0.75, pf.y);
+    color *= mix(1.0, scanGap, uScanlineIntensity);
+
+    // --- Glow (multi-sample blur around edges) ---
+    float glow = 0.0;
+    float glowSize = uGlowSize;
+    for (int i = 0; i < 12; i++) {
+        float angle = float(i) * 0.5236;
+        vec2 dir = vec2(cos(angle), sin(angle));
+        glow += texture2D(uTex, clamp(texUv + dir * glowSize, 0.0, 1.0)).r;
+        glow += texture2D(uTex, clamp(texUv + dir * glowSize * 2.5, 0.0, 1.0)).r;
+    }
+    glow /= 24.0;
+
+    float pulse = sin(uTime * 1.5) * 0.5 + 0.5;
+    float glowHue = fract(uTime * 0.04 + 0.55);
+    vec3 glowColor = hsv2rgb(vec3(glowHue, 0.6, 1.0));
+    color += glow * glowColor * (uGlowIntensity + pulse * 0.15);
+
+
+    // --- RGB phosphor subpixels (scaled to CRT pixels) ---
+    float subX = floor(pf.x * 3.0);
+    vec3 phosphor = vec3(
+        step(subX, 0.5),
+        step(0.5, subX) * step(subX, 1.5),
+        step(1.5, subX)
+    );
+    // Soften phosphor dot edges
+    float dotEdge = 1.0 - 2.0 * abs(fract(pf.x * 3.0) - 0.5);
+    phosphor *= 0.7 + 0.3 * dotEdge;
+    color *= mix(vec3(1.0), phosphor * 2.0, uPhosphorIntensity);
+
+    // --- Pixel cell structure (darken gaps between pixels) ---
+    float cellX = smoothstep(0.0, 0.12, pf.x) * smoothstep(1.0, 0.88, pf.x);
+    color *= mix(1.0, cellX, 0.3);
+
+    // --- CRT flicker ---
+    float flicker = 1.0 + (sin(uTime * 60.0) * 0.01 + sin(uTime * 13.7) * 0.008) * uCrtFlicker;
+    color *= flicker;
+
+    // --- CRT edge darkening (vignette) ---
+    float vig = 1.0 - dot(uv - 0.5, uv - 0.5) * uVignette;
+    color *= clamp(vig, 0.0, 1.0);
+
+    // --- Dither (anti-banding) ---
+    color += hash(vUv * uRes + fract(uTime)) * 0.01;
+
+    gl_FragColor = vec4(max(color, 0.0), 1.0);
+}`;
+
+// --- Build shader program ---
+const vs = compileShader(gl.VERTEX_SHADER, vertexSrc);
+const fs = compileShader(gl.FRAGMENT_SHADER, fragmentSrc);
+const program = gl.createProgram();
+gl.attachShader(program, vs);
+gl.attachShader(program, fs);
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('Link error:', gl.getProgramInfoLog(program));
+}
+gl.useProgram(program);
+
+// --- Fullscreen quad ---
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+// --- Uniform locations ---
+const loc = {
+    tex:    gl.getUniformLocation(program, 'uTex'),
+    heat:   gl.getUniformLocation(program, 'uHeat'),
+    time:   gl.getUniformLocation(program, 'uTime'),
+    res:    gl.getUniformLocation(program, 'uRes'),
+    trailBright:      gl.getUniformLocation(program, 'uTrailBright'),
+    crtCurvature:     gl.getUniformLocation(program, 'uCrtCurvature'),
+    crtResolution:    gl.getUniformLocation(program, 'uCrtResolution'),
+    scanlineIntensity:gl.getUniformLocation(program, 'uScanlineIntensity'),
+    chromAb:          gl.getUniformLocation(program, 'uChromAb'),
+    crtFlicker:       gl.getUniformLocation(program, 'uCrtFlicker'),
+    vignette:         gl.getUniformLocation(program, 'uVignette'),
+    glowSize:         gl.getUniformLocation(program, 'uGlowSize'),
+    glowIntensity:    gl.getUniformLocation(program, 'uGlowIntensity'),
+    holoSat:          gl.getUniformLocation(program, 'uHoloSat'),
+    holoSpeed:        gl.getUniformLocation(program, 'uHoloSpeed'),
+    holoMix:          gl.getUniformLocation(program, 'uHoloMix'),
+    phosphorIntensity:gl.getUniformLocation(program, 'uPhosphorIntensity'),
+    brightBoost:      gl.getUniformLocation(program, 'uBrightBoost'),
+    logoOffset:       gl.getUniformLocation(program, 'uLogoOffset'),
+};
+
+// --- Load SVG as WebGL texture ---
+const svgSource = '<svg width="512" height="512" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg">'
+    + '<rect width="160" height="160" fill="black"/>'
+    + '<path d="M112 90C112 97.732 105.732 104 98 104C90.268 104 84 97.732 84 90V88.9725C84 88.082 82.8451 87.7324 82.3512 88.4733L76.6406 97.0391C73.7411 101.388 68.8596 104 63.6328 104C54.9992 104 48.0003 97.0008 48 88.3672V70C48 62.268 54.268 56 62 56C69.732 56 76 62.268 76 70V83.0275C76 83.918 77.1549 84.2676 77.6488 83.5267L83.3594 74.9609C86.2589 70.6121 91.1404 68 96.3672 68C105.001 68.0003 112 74.9992 112 83.6328V90Z" fill="#EFF3F7"/>'
+    + '</svg>';
+
+const texture = gl.createTexture();
+const img = new Image();
+img.onload = () => {
+    const offscreen = document.createElement('canvas');
+    offscreen.width = offscreen.height = 512;
+    offscreen.getContext('2d').drawImage(img, 0, 0, 512, 512);
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offscreen);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    requestAnimationFrame(frame);
+};
+img.src = 'data:image/svg+xml;base64,' + btoa(svgSource);
+
+// --- Heat map (phosphor persistence) ---
+const HEAT_W = 320, HEAT_H = 180;
+const heatCanvas = document.createElement('canvas');
+heatCanvas.width = HEAT_W;
+heatCanvas.height = HEAT_H;
+const heatCtx = heatCanvas.getContext('2d');
+heatCtx.fillStyle = '#000';
+heatCtx.fillRect(0, 0, HEAT_W, HEAT_H);
+
+const heatTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D, heatTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+// --- Mouse tracking ---
+function pushMouse(x, y) {
+    mouseX = x;
+    mouseY = y;
+    mouseHistory.shift();
+    mouseHistory.push({ x, y });
+}
+canvas.addEventListener('mousemove', e => {
+    pushMouse(e.clientX / viewW, e.clientY / viewH);
+});
+canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    pushMouse(t.clientX / viewW, t.clientY / viewH);
+}, { passive: false });
+
+// --- DVD bounce state ---
+// Logo occupies roughly 1/scale of the screen in each axis
+// We track position as the center offset from screen center (in 0-1 UV space)
+let dvdX = 0, dvdY = 0;
+let dvdVx = 0.12, dvdVy = 0.08; // UV units per second
+
+// --- Render loop ---
+let lastTime = 0;
+function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min((now - lastTime) / 1000, 0.1);
+    lastTime = now;
+
+    time += dt;
+
+    // --- DVD bounce update ---
+    const aspect = viewW / viewH;
+    const logoScale = aspect > 1 ? 2.8 : 2.0;
+    // Derived from shader: logoUv = (pixelUv - 0.5) * [aspect,1] * scale + 0.5 - offset * scale
+    // Logo content bounds in texture coords: x [0.3, 0.7], y [0.35, 0.65]
+    const maxX = aspect / 2 - 0.2 / logoScale;
+    const maxY = 0.5 - 0.15 / logoScale;
+
+    dvdX += dvdVx * dt;
+    dvdY += dvdVy * dt;
+
+    if (dvdX > maxX)  { dvdX = maxX;  dvdVx = -Math.abs(dvdVx); }
+    if (dvdX < -maxX) { dvdX = -maxX; dvdVx =  Math.abs(dvdVx); }
+    if (dvdY > maxY)  { dvdY = maxY;  dvdVy = -Math.abs(dvdVy); }
+    if (dvdY < -maxY) { dvdY = -maxY; dvdVy =  Math.abs(dvdVy); }
+
+    // Update heat map: fade then draw cursor trail
+    const fadeAlpha = 1 - Math.pow(0.01, dt / cfg.fadeSec);
+    heatCtx.fillStyle = `rgba(0, 0, 0, ${fadeAlpha.toFixed(4)})`;
+    heatCtx.fillRect(0, 0, HEAT_W, HEAT_H);
+
+    // Catmull-Rom spline through last 4 mouse positions
+    const p0 = mouseHistory[0], p1 = mouseHistory[1],
+          p2 = mouseHistory[2], p3 = mouseHistory[3];
+    const steps = cfg.smoothing;
+    heatCtx.strokeStyle = '#fff';
+    heatCtx.lineWidth = cfg.width;
+    heatCtx.lineCap = 'round';
+    heatCtx.lineJoin = 'round';
+    heatCtx.beginPath();
+    heatCtx.moveTo(p1.x * HEAT_W, p1.y * HEAT_H);
+    for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const sx = catmullRom(p0.x, p1.x, p2.x, p3.x, t);
+        const sy = catmullRom(p0.y, p1.y, p2.y, p3.y, t);
+        heatCtx.lineTo(sx * HEAT_W, sy * HEAT_H);
+    }
+    heatCtx.stroke();
+    prevMouseX = mouseX;
+    prevMouseY = mouseY;
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, heatTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, heatCanvas);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+
+    gl.uniform1i(loc.tex, 0);
+    gl.uniform1i(loc.heat, 1);
+    gl.uniform1f(loc.time, time);
+    gl.uniform2f(loc.res, canvas.width, canvas.height);
+    gl.uniform1f(loc.trailBright, cfg.brightness);
+    gl.uniform1f(loc.crtCurvature, cfg.crtCurvature);
+    gl.uniform1f(loc.crtResolution, cfg.crtResolution);
+    gl.uniform1f(loc.scanlineIntensity, cfg.scanlineIntensity);
+    gl.uniform1f(loc.chromAb, cfg.chromAb);
+    gl.uniform1f(loc.crtFlicker, cfg.crtFlicker);
+    gl.uniform1f(loc.vignette, cfg.vignette);
+    gl.uniform1f(loc.glowSize, cfg.glowSize);
+    gl.uniform1f(loc.glowIntensity, cfg.glowIntensity);
+    gl.uniform1f(loc.holoSat, cfg.holoSat);
+    gl.uniform1f(loc.holoSpeed, cfg.holoSpeed);
+    gl.uniform1f(loc.holoMix, cfg.holoMix);
+    gl.uniform1f(loc.phosphorIntensity, cfg.phosphorIntensity);
+    gl.uniform1f(loc.brightBoost, cfg.brightBoost);
+    gl.uniform2f(loc.logoOffset, dvdX, dvdY);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+})();
+</script>
+
+<!-- Control Panel -->
+<style>
+#ctrl {
+    position:fixed;top:16px;right:16px;z-index:999;
+    background:rgba(0,0,0,0.82);border:1px solid rgba(255,255,255,0.15);
+    border-radius:8px;padding:14px 18px;min-width:220px;
+    font:12px/1.6 'SF Mono',Monaco,Consolas,monospace;color:#ccc;
+    user-select:none;backdrop-filter:blur(6px);
+    max-height:calc(100vh - 40px);overflow-y:auto;
+}
+#ctrl::-webkit-scrollbar{width:4px}
+#ctrl::-webkit-scrollbar-track{background:transparent}
+#ctrl::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:2px}
+#ctrl .sec{font-size:11px;color:#888;margin:10px 0 6px;letter-spacing:1px}
+#ctrl .sec:first-child{margin-top:0}
+#ctrl label{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+#ctrl label span:first-child{width:82px;flex-shrink:0;font-size:11px}
+#ctrl label input[type=range]{flex:1;accent-color:#fff}
+#ctrl label span:last-child{width:38px;text-align:right;font-size:11px}
+#cursor-row{display:flex;gap:6px;margin-top:4px}
+#cursor-row button{
+    width:36px;height:36px;border:2px solid rgba(255,255,255,0.2);
+    background:rgba(255,255,255,0.05);border-radius:6px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;padding:0;
+}
+#cursor-row button.active{border-color:#fff;background:rgba(255,255,255,0.15)}
+#cursor-row button canvas,#cursor-row button span{pointer-events:none}
+</style>
+
+<div id="ctrl" style="display:none">
+    <div class="sec">CRT EFFECTS <span style="float:right;font-size:10px;color:#555">[H] toggle</span></div>
+
+    <label>
+        <span>Resolution</span>
+        <input type="range" id="sl-crtres" min="10" max="300" step="1" value="180">
+        <span id="rv-crtres">180</span>
+    </label>
+    <label>
+        <span>Chrom. Aberr.</span>
+        <input type="range" id="sl-chrom" min="0.000" max="0.015" step="0.001" value="0.004">
+        <span id="rv-chrom">0.004</span>
+    </label>
+
+    <div class="sec">GLOW &amp; COLOR</div>
+
+    <label>
+        <span>Glow Intensity</span>
+        <input type="range" id="sl-glowint" min="0.0" max="1.0" step="0.01" value="0.25">
+        <span id="rv-glowint">0.25</span>
+    </label>
+    <label>
+        <span>Phosphor</span>
+        <input type="range" id="sl-phos" min="0.0" max="1.0" step="0.01" value="0.35">
+        <span id="rv-phos">0.35</span>
+    </label>
+    <label>
+        <span>Brightness+</span>
+        <input type="range" id="sl-bboost" min="0.5" max="3.0" step="0.05" value="1.4">
+        <span id="rv-bboost">1.40</span>
+    </label>
+
+    <div class="sec">CURSOR</div>
+    <div id="cursor-row"></div>
+</div>
+
+<script>
+(() => {
+    const cfg = window._cfg;
+    const panel = document.getElementById('ctrl');
+    const canvasEl = document.getElementById('c');
+
+    function wire(sliderId, readoutId, key, fmt) {
+        const sl = document.getElementById(sliderId);
+        const rv = document.getElementById(readoutId);
+        sl.addEventListener('input', () => {
+            const v = parseFloat(sl.value);
+            cfg[key] = v;
+            rv.textContent = fmt(v);
+        });
+    }
+
+    // CRT Effects
+    wire('sl-crtres', 'rv-crtres', 'crtResolution',    v => v.toFixed(0));
+    wire('sl-chrom',  'rv-chrom',  'chromAb',           v => v.toFixed(3));
+
+    // Glow & Color
+    wire('sl-glowint', 'rv-glowint', 'glowIntensity',     v => v.toFixed(2));
+    wire('sl-phos',    'rv-phos',    'phosphorIntensity',  v => v.toFixed(2));
+    wire('sl-bboost',  'rv-bboost',  'brightBoost',        v => v.toFixed(2));
+
+    // --- Cursor selector ---
+    function makeCursor(draw, w, h, hx, hy) {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        draw(c.getContext('2d'), w, h);
+        return `url(${c.toDataURL()}) ${hx} ${hy}, auto`;
+    }
+
+    const cursorCSS = {
+        crosshair: 'crosshair',
+        dot: makeCursor((ctx, w) => {
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(8, 8, 4, 0, Math.PI * 2);
+            ctx.fill();
+        }, 16, 16, 8, 8),
+        smiley: makeCursor((ctx, w, h) => {
+            // Yellow face
+            ctx.fillStyle = '#FFD700';
+            ctx.beginPath();
+            ctx.arc(12, 12, 11, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            // Eyes
+            ctx.fillStyle = '#000';
+            ctx.beginPath();
+            ctx.arc(8, 9, 1.8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(16, 9, 1.8, 0, Math.PI * 2);
+            ctx.fill();
+            // Smile
+            ctx.beginPath();
+            ctx.arc(12, 12, 6, 0.2, Math.PI - 0.2);
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }, 24, 24, 12, 12),
+        mac: makeCursor((ctx) => {
+            // Classic Mac arrow (black outline, white fill)
+            ctx.fillStyle = '#fff';
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(1, 1);
+            ctx.lineTo(1, 16);
+            ctx.lineTo(5, 12);
+            ctx.lineTo(8, 18);
+            ctx.lineTo(10, 17);
+            ctx.lineTo(7, 11);
+            ctx.lineTo(12, 11);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        }, 16, 24, 1, 1),
+        horrible: makeCursor((ctx) => {
+            ctx.save();
+            ctx.scale(48/160, 48/160);
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.moveTo(112,90);ctx.bezierCurveTo(112,97.732,105.732,104,98,104);ctx.bezierCurveTo(90.268,104,84,97.732,84,90);ctx.lineTo(84,88.9725);ctx.bezierCurveTo(84,88.082,82.8451,87.7324,82.3512,88.4733);ctx.lineTo(76.6406,97.0391);ctx.bezierCurveTo(73.7411,101.388,68.8596,104,63.6328,104);ctx.bezierCurveTo(54.9992,104,48.0003,97.0008,48,88.3672);ctx.lineTo(48,70);ctx.bezierCurveTo(48,62.268,54.268,56,62,56);ctx.bezierCurveTo(69.732,56,76,62.268,76,70);ctx.lineTo(76,83.0275);ctx.bezierCurveTo(76,83.918,77.1549,84.2676,77.6488,83.5267);ctx.lineTo(83.3594,74.9609);ctx.bezierCurveTo(86.2589,70.6121,91.1404,68,96.3672,68);ctx.bezierCurveTo(105.001,68.0003,112,74.9992,112,83.6328);ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+        }, 48, 48, 24, 24),
+    };
+
+    function applyCursor(key) {
+        cfg.cursor = key;
+        const css = cursorCSS[key] || 'crosshair';
+        document.body.style.cursor = css;
+        canvasEl.style.cursor = css;
+        // Update button active states
+        row.querySelectorAll('button').forEach(b => {
+            b.classList.toggle('active', b.dataset.cursor === key);
+        });
+    }
+
+    // Build cursor buttons
+    const row = document.getElementById('cursor-row');
+    const cursorButtons = [
+        { key: 'crosshair', label: '+', title: 'Crosshair' },
+        { key: 'dot',       label: '\u25CF', title: 'Dot' },
+        { key: 'smiley',    label: '\u263A', title: 'Smiley' },
+        { key: 'mac',       label: '\u2196', title: 'Mac Arrow' },
+        // { key: 'horrible', label: '', title: 'Horrible', isSvg: true },
+    ];
+    const hLogoSvg = '<svg width="28" height="28" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M112 90C112 97.732 105.732 104 98 104C90.268 104 84 97.732 84 90V88.9725C84 88.082 82.8451 87.7324 82.3512 88.4733L76.6406 97.0391C73.7411 101.388 68.8596 104 63.6328 104C54.9992 104 48.0003 97.0008 48 88.3672V70C48 62.268 54.268 56 62 56C69.732 56 76 62.268 76 70V83.0275C76 83.918 77.1549 84.2676 77.6488 83.5267L83.3594 74.9609C86.2589 70.6121 91.1404 68 96.3672 68C105.001 68.0003 112 74.9992 112 83.6328V90Z" fill="#ccc"/></svg>';
+    cursorButtons.forEach(({ key, label, title, isSvg }) => {
+        const btn = document.createElement('button');
+        btn.dataset.cursor = key;
+        btn.title = title;
+        btn.innerHTML = isSvg ? hLogoSvg : `<span style="font-size:16px;color:#ccc;line-height:1">${label}</span>`;
+        btn.addEventListener('click', () => applyCursor(key));
+        row.appendChild(btn);
+    });
+
+    // Set initial cursor
+    applyCursor(cfg.cursor);
+
+    // Toggle panel visibility
+    document.addEventListener('keydown', e => {
+        if (e.key === 'h' || e.key === 'H') {
+            panel.style.display = panel.style.display === 'none' ? '' : 'none';
+        }
+    });
+})();
+</script>
+</body>
+</html>
