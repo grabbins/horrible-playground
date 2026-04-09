@@ -580,10 +580,10 @@ function updateVisualizer(dt, t) {
     }
 
     // 136 BPM locked pulse — only kicks in after the drop (~29s)
-    const elapsed = t - sandstormStartTime;
+    const audioTime = sandstormAudio ? sandstormAudio.currentTime : 0;
     let beatPulseVal = 0;
-    if (elapsed > 29) {
-        const beatPhase = (elapsed % BEAT_INTERVAL) / BEAT_INTERVAL;
+    if (audioTime > 29) {
+        const beatPhase = (audioTime % BEAT_INTERVAL) / BEAT_INTERVAL;
         beatPulseVal = Math.cos(beatPhase * Math.PI * 2) * 0.5 + 0.5;
     }
 
